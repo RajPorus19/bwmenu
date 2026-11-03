@@ -1,0 +1,75 @@
+[
+  {
+    "id": "id-github",
+    "name": "GitHub",
+    "folderId": "f1",
+    "login": {
+      "username": "zoomer@example.com",
+      "password": "gh-pass-123",
+      "uris": [{"uri": "https://github.com"}]
+    }
+  },
+  {
+    "id": "id-arch",
+    "name": "Arch Linux",
+    "folderId": "f2",
+    "login": {
+      "username": "zoomer",
+      "password": "arch-secret",
+      "uris": [{"uri": "https://archlinux.org"}]
+    }
+  },
+  {
+    "id": "id-mail-a",
+    "name": "Mail",
+    "folderId": null,
+    "login": {
+      "username": "a@example.com",
+      "password": "mail-pass-A",
+      "uris": [{"uri": "https://mail-a.example"}]
+    }
+  },
+  {
+    "id": "id-mail-b",
+    "name": "Mail",
+    "folderId": "f2",
+    "login": {
+      "username": "b@example.com",
+      "password": "mail-pass-B",
+      "uris": [{"uri": "https://mail-b.example"}]
+    }
+  },
+  {
+    "id": "id-minimal",
+    "name": "Minimal",
+    "login": {
+      "username": null,
+      "password": "min-pass",
+      "uris": []
+    }
+  },
+  {
+    "id": "id-totp",
+    "name": "TOTP Test",
+    "folderId": "f1",
+    "login": {
+      "username": "totpuser",
+      "password": "totp-pass",
+      "totp": "otpauth://totp/Test:totpuser?secret=JBSWY3DPEHPK3PXP&issuer=Test",
+      "uris": [{"uri": "https://totp.example"}]
+    }
+  },
+  {
+    "id": "id-note",
+    "name": "Secure Note",
+    "type": 2,
+    "notes": "sensitive-note-content",
+    "secureNote": {"type": 0}
+  },
+  {
+    "id": "id-card",
+    "name": "Credit Card",
+    "type": 3,
+    "card": {"brand": "Visa", "number": "4111111111111111", "code": "123"}
+  }
+]

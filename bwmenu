@@ -1,0 +1,313 @@
+#!/usr/bin/env bash
+#
+# bwmenu — fast Bitwarden vault menu (fzf + local JSON cache).
+#
+# Bitwarden is contacted only once at startup to refresh the local cache.
+# All searching, selection and field retrieval happen against that cache.
+# The menu stays open until you press Esc/Ctrl-C, so you can copy any number
+# of entries in one session.
+#
+# Usage:
+#   export BW_SESSION="$(bw unlock --raw)"
+#   bwmenu [--offline]
+#
+set -euo pipefail
+
+# Resolve paths relative to this script (survives symlinks into PATH).
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+CACHE_DIR="${BW_MENU_CACHE_DIR:-$SCRIPT_DIR}"
+CACHE="$CACHE_DIR/vault.json"
+FOLDERS="$CACHE_DIR/folders.json"
+HELPER="$SCRIPT_DIR/lib/bwmenu.py"
+
+err() { echo "bwmenu: $*" >&2; }
+
+# ---------------------------------------------------------------------------
+# Options
+# ---------------------------------------------------------------------------
+OFFLINE=0
+SYNC=1
+usage() {
+    cat <<'EOF'
+bwmenu — Bitwarden vault menu (fzf + local JSON cache)
+
+Usage:
+  export BW_SESSION="$(bw unlock --raw)"   # unlock once per shell session
+  bwmenu [OPTIONS]
+
+Options:
+  --offline   Skip the startup vault refresh and use the existing cache.
+  --sync      Sync the vault (bw sync) before refreshing the cache (default).
+  --no-sync   Skip the sync; refresh from the CLI's local cache.
+  --help      Show this help.
+
+Keys (in the menu — it stays open after each action):
+  Enter       copy password
+  Ctrl-U      copy username
+  Ctrl-Y      copy URI
+  Ctrl-T      copy TOTP code
+  Ctrl-O      open the item's website
+  Esc/Ctrl-C  exit
+EOF
+}
+for arg in "$@"; do
+    case "$arg" in
+        --offline|-o) OFFLINE=1 ;;
+        --sync)        SYNC=1 ;;
+        --no-sync)     SYNC=0 ;;
+        --help|-h)     usage; exit 0 ;;
+        *)             err "unknown option: $arg"; usage >&2; exit 2 ;;
+    esac
+done
+
+# ---------------------------------------------------------------------------
+# Re-launch in a terminal when there is no controlling TTY (launched from
+# dmenu or a hotkey). Disable with BW_MENU_NO_RELAUNCH=1 (used by tests).
+# ---------------------------------------------------------------------------
+if [ ! -t 0 ] && [ -z "${BW_MENU_NO_RELAUNCH:-}" ]; then
+    term="${BW_MENU_TERMINAL:-}"
+    if [ -z "$term" ]; then
+        for c in "${TERMINAL:-}" st alacritty kitty foot xterm urxvt konsole gnome-terminal; do
+            [ -n "$c" ] && command -v "$c" >/dev/null 2>&1 && { term="$c"; break; }
+        done
+    fi
+    if [ -n "$term" ]; then
+        exec "$term" -e "$(readlink -f "${BASH_SOURCE[0]}")" "$@"
+    fi
+    err "no terminal available to launch in."
+    err "run from a terminal, or set BW_MENU_TERMINAL to your terminal command."
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Dependencies
+# ---------------------------------------------------------------------------
+CLIP_CMD=""
+pick_clipboard() {
+    if [ -n "${WAYLAND_DISPLAY:-}" ] && command -v wl-copy >/dev/null 2>&1; then
+        CLIP_CMD="wl-copy"; return 0
+    fi
+    if [ -n "${DISPLAY:-}" ]; then
+        command -v xclip >/dev/null 2>&1 && { CLIP_CMD="xclip"; return 0; }
+        command -v xsel  >/dev/null 2>&1 && { CLIP_CMD="xsel";  return 0; }
+    fi
+    command -v wl-copy >/dev/null 2>&1 && { CLIP_CMD="wl-copy"; return 0; }
+    return 1
+}
+check_deps() {
+    local missing=0
+    for c in bw fzf python3; do
+        command -v "$c" >/dev/null 2>&1 || { err "missing dependency: $c"; missing=1; }
+    done
+    if ! pick_clipboard; then
+        err "no clipboard utility found (install wl-clipboard on Wayland, or xclip/xsel on X11)"
+        missing=1
+    fi
+    return "$missing"
+}
+check_deps || exit 1
+
+# ---------------------------------------------------------------------------
+# Bitwarden session — use BW_SESSION if valid, otherwise unlock once.
+# The session key is never written to disk.
+# ---------------------------------------------------------------------------
+setup_session() {
+    if [ -n "${BW_SESSION:-}" ]; then
+        if bw unlock --check >/dev/null 2>&1; then
+            export BW_SESSION
+            return 0
+        fi
+        err "BW_SESSION is invalid or expired."
+        err 'refresh it with: export BW_SESSION="$(bw unlock --raw)"'
+        return 1
+    fi
+    echo "bwmenu: vault locked — unlocking (enter your master password)..." >&2
+    if ! BW_SESSION="$(bw unlock --raw)"; then
+        err "unlock failed."
+        err 'unlock manually, then: export BW_SESSION="$(bw unlock --raw)"'
+        return 1
+    fi
+    export BW_SESSION
+    return 0
+}
+setup_session || exit 1
+
+# ---------------------------------------------------------------------------
+# Cache refresh — a single Bitwarden call per file, before the menu opens.
+# A spinner is shown while the vault is being fetched. Write to a temp file,
+# validate, then atomically replace; a bad response never clobbers a good
+# cache.
+# ---------------------------------------------------------------------------
+cleanup() { rm -f "$CACHE.tmp.$$" "$FOLDERS.tmp.$$" 2>/dev/null || true; }
+trap cleanup EXIT
+
+run_spinner() {
+    # $1 = message; loops forever until killed. Only meaningful on a TTY.
+    local msg="$1" frames=('|' '/' '-' '\') i=0
+    while :; do
+        printf '\r[%s] %s ' "${frames[i]}" "$msg" >&2
+        i=$(( (i + 1) % 4 ))
+        sleep 0.1
+    done
+}
+
+refresh_file() {
+    # $1 = bw subcommand ("items"|"folders"), $2 = destination, $3 = spinner msg
+    local what="$1" dst="$2" msg="$3" tmp spinner_pid="" rc=0
+    tmp="$dst.tmp.$$"
+    umask 077
+    if [ -t 2 ] && [ -n "$msg" ]; then
+        run_spinner "$msg" &
+        spinner_pid=$!
+    fi
+    bw list "$what" > "$tmp" 2>/dev/null || rc=1
+    if [ -n "$spinner_pid" ]; then
+        kill "$spinner_pid" 2>/dev/null || true
+        wait "$spinner_pid" 2>/dev/null || true
+        printf '\r\033[K' >&2
+    fi
+    if [ "$rc" -ne 0 ]; then rm -f "$tmp"; return 1; fi
+    if ! python3 "$HELPER" validate "$tmp"; then rm -f "$tmp"; return 1; fi
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$dst"
+    chmod 600 "$dst"
+    return 0
+}
+
+mkdir -p "$CACHE_DIR"
+
+if [ "$OFFLINE" -eq 1 ]; then
+    if [ ! -s "$CACHE" ]; then
+        err "offline mode requested but no cache exists at $CACHE"
+        exit 1
+    fi
+else
+    if [ "$SYNC" -eq 1 ]; then
+        if ! bw sync >/dev/null 2>&1; then
+            err "vault sync failed; continuing with cached data."
+        fi
+    fi
+    if ! refresh_file items "$CACHE" "Fetching vault..."; then
+        err "vault refresh failed; previous cache (if any) left untouched."
+        err "is the vault unlocked and BW_SESSION valid?"
+        exit 1
+    fi
+    # Folder names are optional display metadata; a failure here is non-fatal.
+    refresh_file folders "$FOLDERS" "" || true
+fi
+
+# ---------------------------------------------------------------------------
+# Build menu records once, from the cache only.
+# ---------------------------------------------------------------------------
+records="$(python3 "$HELPER" records "$CACHE" "$FOLDERS")" || {
+    err "failed to parse cache $CACHE"
+    exit 1
+}
+if [ -z "$records" ]; then
+    err "no login entries found in the vault."
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Clipboard and actions — secrets travel via stdin, never argv. These return
+# (not exit) so the menu loop keeps running after each action.
+# ---------------------------------------------------------------------------
+run_clipboard() {
+    case "$CLIP_CMD" in
+        wl-copy) wl-copy ;;
+        xclip)   xclip -selection clipboard ;;
+        xsel)    xsel --clipboard --input ;;
+        *)       return 1 ;;
+    esac
+}
+
+copy_field() {
+    local field="$1" value
+    if ! value="$(python3 "$HELPER" get "$CACHE" "$item_id" "$field" 2>/dev/null)"; then
+        err "could not read '$field' for '$item_name'."
+        return 1
+    fi
+    if [ -z "$value" ]; then
+        case "$field" in
+            totp)     err "no TOTP configured for '$item_name'." ;;
+            password) err "no password stored for '$item_name'." ;;
+            *)        err "no $field for '$item_name'." ;;
+        esac
+        return 1
+    fi
+    if ! printf '%s' "$value" | run_clipboard; then
+        err "clipboard copy failed (via $CLIP_CMD)."
+        return 1
+    fi
+    case "$field" in
+        password) printf 'Password copied: %s\n' "$item_name" ;;
+        username) printf 'Username copied: %s\n' "$item_name" ;;
+        uri)      printf 'URI copied: %s\n' "$item_name" ;;
+        totp)     printf 'TOTP copied: %s\n' "$item_name" ;;
+        *)        printf 'Copied: %s\n' "$item_name" ;;
+    esac
+}
+
+open_uri() {
+    local uri
+    if ! uri="$(python3 "$HELPER" get "$CACHE" "$item_id" uri 2>/dev/null)"; then
+        err "could not read URI for '$item_name'."
+        return 1
+    fi
+    if [ -z "$uri" ]; then
+        err "no URI stored for '$item_name'."
+        return 1
+    fi
+    if ! command -v xdg-open >/dev/null 2>&1; then
+        err "xdg-open not found; cannot open URI."
+        return 1
+    fi
+    nohup xdg-open "$uri" >/dev/null 2>&1 &
+    printf 'Opening: %s\n' "$item_name"
+}
+
+# ---------------------------------------------------------------------------
+# Menu loop — fzf reopens after every action, restoring the previous query,
+# until the user presses Esc/Ctrl-C.
+# ---------------------------------------------------------------------------
+HEADER=$'ENTER  copy password      Ctrl-U  copy username\nCtrl-Y  copy URI          Ctrl-T  copy TOTP\nCtrl-O  open website       Esc/Ctrl-C  exit'
+
+query=""
+while :; do
+    out="$(fzf \
+        --delimiter=$'\t' \
+        --nth=1..4 \
+        --with-nth=1..4 \
+        --expect=ctrl-u,ctrl-y,ctrl-t,ctrl-o \
+        --print-query --query="$query" \
+        --header="$HEADER" \
+        --prompt='bw> ' \
+        --no-multi \
+        --tiebreak=index \
+        <<<"$records")" || { printf '\n' >&2; break; }
+
+    # fzf emits "<query>\n<key>\n<record>"; query/key may be empty for a plain
+    # Enter with no query text.
+    out="${out//$'\r'/}"
+    query="${out%%$'\n'*}"
+    rest="${out#*$'\n'}"
+    key="${rest%%$'\n'*}"
+    record="${rest#*$'\n'}"
+
+    # No match + Enter returns the raw query (no tab). Report and reopen.
+    case "$record" in
+        *$'\t'*) : ;;
+        *)       err "no matching entry."; continue ;;
+    esac
+
+    item_id="${record##*$'\t'}"
+    item_name="${record%%$'\t'*}"
+
+    case "$key" in
+        ctrl-u) copy_field username ;;
+        ctrl-y) copy_field uri ;;
+        ctrl-t) copy_field totp ;;
+        ctrl-o) open_uri ;;
+        *)      copy_field password ;;
+    esac || :   # action errors are already reported; keep the menu open
+done

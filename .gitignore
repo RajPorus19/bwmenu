@@ -1,0 +1,12 @@
+# Bitwarden vault cache — full plaintext vault, NEVER commit.
+/vault.json
+/folders.json
+
+# Temporary files written during atomic cache refresh.
+*.tmp.*
+.vault.json.tmp.*
+.folders.json.tmp.*
+
+# Local secrets / editor cruft.
+*.bak
+*~
